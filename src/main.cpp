@@ -1,4 +1,3 @@
-#include <Adafruit_ADS1X15.h>
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -6,12 +5,17 @@
 
 #include <optional>
 
-#include "SparkFun_LSM6DSV16X.h"
+#include "Adafruit_ADS1X15.h"
+#include "ImuHal.h"
+#include "ImuTypes.h"
+#include "LSM6DSV16X.h"
+#include "MicrosecondTimer.h"
+#include "Vector3D.h"
 
-SparkFun_LSM6DSV16X lsm;
+LSM6DSV16X imu(Wire);
 Adafruit_ADS1115 ads1115;
 
-const char* const TAG{"CrankSensor"};
+const char* const TAG{"Main"};
 
 // Bluetooth assigned IDs
 // https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Assigned_Numbers/out/en/Assigned_Numbers.pdf?v=1723972973095
@@ -42,7 +46,7 @@ constexpr char raw_strain_uuid[] = "df0a6fbd-701d-4de6-87aa-0a0bb7cf27d1";
 // RW characteristics
 BLECharacteristic* period_ms{nullptr};
 
-// Read characteristics
+// Direct-access characteristics for debug/dev stuff
 BLECharacteristic* timestamp{nullptr};
 BLECharacteristic* acc_x{nullptr};
 BLECharacteristic* acc_y{nullptr};
@@ -65,96 +69,6 @@ BLEDescriptor amp_strain_desc("2901", 32);
 BLEDescriptor raw_strain_desc("2901", 32);
 
 uint32_t sample_period_ms{500};
-
-class MicrosecondTimer {
-  public:
-    explicit MicrosecondTimer(const char* name) : _name(name) {
-        ESP_LOGI(TAG, " Timer %s starting", _name);
-        _start_us = micros();
-    }
-    ~MicrosecondTimer() {
-        uint32_t total_elapsed_us{_elapsed()};
-        uint32_t last_chunk_us{micros() - _start_us};
-        ESP_LOGI(TAG,
-                 "~Timer %s complete - Last: %u us, Total: %u us",
-                 _name,
-                 last_chunk_us,
-                 total_elapsed_us);
-    }
-
-    // Pauses while printing to avoid skewing results
-    void print_time(const char* tag) {
-        uint32_t elapsed_us{_elapsed()};
-        uint32_t last_chunk_us{micros() - _start_us};
-        ESP_LOGI(TAG,
-                 ">Timer %s:%s - Last: %u us, Total: %u us",
-                 _name,
-                 tag,
-                 last_chunk_us,
-                 elapsed_us);
-        _running_count += elapsed_us;
-        _start_us = micros();
-    }
-
-  private:
-    uint32_t _elapsed() const { return _running_count + (micros() - _start_us); }
-
-    uint32_t _running_count{0};
-    uint32_t _start_us{0};
-    const char* _name;
-};
-
-class Vec3D {
-  public:
-    constexpr Vec3D(float x, float y, float z) : _x(x), _y(y), _z(z) {}
-
-    constexpr float mag() const {
-        float sum_sq{(_x * _x) + (_y * _y) + (_z * _z)};
-        return std::sqrt(sum_sq);
-    }
-
-    // Returning by const reference for now due to silly BLE lib decisions
-    constexpr float x() const { return _x; }
-    constexpr float y() const { return _y; }
-    constexpr float z() const { return _z; }
-
-  private:
-    float _x;
-    float _y;
-    float _z;
-};
-
-class GyroData : public Vec3D {
-  public:
-    constexpr GyroData(sfe_lsm_data_t data) : Vec3D(data.xData, data.yData, data.zData) {}
-};
-
-class AccData : public Vec3D {
-  public:
-    constexpr AccData(sfe_lsm_data_t data) : Vec3D(data.xData, data.yData, data.zData) {}
-};
-
-std::optional<GyroData> read_gyro(SparkFun_LSM6DSV16X& _lsm) {
-    sfe_lsm_data_t gyr_data;
-
-    if (!_lsm.getGyro(&gyr_data)) {
-        ESP_LOGE(TAG, "gyr read failed");
-        return std::nullopt;
-    }
-
-    return GyroData(gyr_data);
-}
-
-std::optional<AccData> read_acc(SparkFun_LSM6DSV16X& _lsm) {
-    sfe_lsm_data_t acc_data;
-
-    if (!_lsm.getAccel(&acc_data)) {
-        ESP_LOGE(TAG, "acc read failed");
-        return std::nullopt;
-    }
-
-    return AccData(acc_data);
-}
 
 // This is useful for initial testing but will be biased by other rotations. Probably shouldn't
 // affect accuracy too much though - roll and yaw rates won't be *that* high!
@@ -273,45 +187,9 @@ void init_ble() {
 }
 
 void init_imu() {
-    if (!lsm.begin(Wire)) {
-        ESP_LOGE(TAG, "Could not start accelerometer");
-        vTaskDelay(portMAX_DELAY);
+    if (!imu.begin()) {
+        ESP_LOGE(TAG, "IMU failed to start");
     }
-    pinMode(23, OUTPUT);
-
-    // Reset the device to default settings. This if helpful is you're doing
-    // multiple uploads testing different settings.
-    lsm.deviceReset();
-
-    // Wait for it to finish resetting
-    while (!lsm.getDeviceReset()) {
-        delay(1);
-    }
-
-    Serial.println("Board has been reset, applying settings.");
-
-    // Accelerometer and Gyroscope registers will not be updated
-    // until read.
-    lsm.enableBlockDataUpdate();
-
-    // Set the output data rate and precision of the accelerometer
-    lsm.setAccelDataRate(LSM6DSV16X_ODR_AT_960Hz);
-    lsm.setAccelFullScale(LSM6DSV16X_16g);
-
-    // Set the output data rate and precision of the gyroscope
-    lsm.setGyroDataRate(LSM6DSV16X_ODR_AT_960Hz);
-    lsm.setGyroFullScale(LSM6DSV16X_2000dps);
-
-    // Enable filter settling.
-    lsm.enableFilterSettling();
-
-    // Turn on the accelerometer's filter and apply settings.
-    lsm.enableAccelLP2Filter();
-    lsm.setAccelLP2Bandwidth(LSM6DSV16X_XL_STRONG);
-
-    // Turn on the gyroscope's filter and apply settings.
-    lsm.enableGyroLP1Filter();
-    lsm.setGyroLP1Bandwidth(LSM6DSV16X_GY_MEDIUM);
 }
 
 void init_adc() {
@@ -325,6 +203,8 @@ void setup() {
     Wire.begin(6, 7, 400000);
     delay(500);
     while (!Serial);
+
+    pinMode(23, OUTPUT);
 
     MicrosecondTimer timer("Setup");
     init_imu();
@@ -369,16 +249,13 @@ void loop() {
     loop_timer.print_time("timestamp");
 
     // IMU
-    digitalWrite(23, HIGH);
 
     uint32_t start_us{micros()};
-    auto acc_data{read_acc(lsm)};
-    auto gyro_data{read_gyro(lsm)};
+    auto acc_data{imu.read_acc()};
+    auto gyro_data{imu.read_gyro()};
     uint32_t duration_us{micros() - start_us};
 
     loop_timer.print_time("imu-read");
-
-    digitalWrite(23, LOW);
 
     if (acc_data.has_value()) {
         set_acc_characteristics(*acc_data);
@@ -403,8 +280,8 @@ void loop() {
     loop_timer.print_time("adc-char-set");
 
     if (acc_data.has_value() && gyro_data.has_value()) {
-        float acc_mag_mg{acc_data->mag()};
-        float gyr_mag_mdps{gyro_data->mag()};
+        float acc_mag_mg{acc_data->magnitude()};
+        float gyr_mag_mdps{gyro_data->magnitude()};
 
         loop_timer.print_time("imu-mag");
 
@@ -432,6 +309,8 @@ void loop() {
     ESP_LOGI(TAG, "ADC: Raw: %i, Amp: %i", raw, ampd);
 
     loop_timer.print_time("adc-print");
+    digitalWrite(23, LOW);
     xTaskDelayUntil(&last_update, pdMS_TO_TICKS(sample_period_ms));
     loop_timer.print_time("delay");
+    digitalWrite(23, HIGH);
 }
